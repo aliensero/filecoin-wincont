@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
 
@@ -23,6 +25,7 @@ func main() {
 
 	local := []*cli.Command{
 		runCmd,
+		verifyCmd,
 	}
 	app := &cli.App{
 		Name:     "lotus-wincount",
@@ -53,6 +56,10 @@ var runCmd = &cli.Command{
 		},
 		&cli.StringFlag{
 			Name: "path",
+		},
+		&cli.StringFlag{
+			Name:  "out",
+			Value: "./winningProofs",
 		},
 	},
 	Action: func(cctx *cli.Context) error {
@@ -122,6 +129,28 @@ var runCmd = &cli.Command{
 					if err != nil {
 						return err
 					}
+					if cctx.String("out") != "" {
+						out := WinningOut{
+							MinerID:    minerID,
+							Sectors:    mbi.Sectors,
+							Randomness: randomness,
+							Proofs:     proofs,
+						}
+
+						b, err := json.Marshal(out)
+						if err != nil {
+							return err
+						}
+						f, err := os.OpenFile(cctx.String("out"), os.O_CREATE|os.O_RDWR, 0644)
+						if err != nil {
+							return err
+						}
+						defer f.Close()
+						_, err = f.Write(b)
+						if err != nil {
+							return err
+						}
+					}
 					ok, err := verifyWinningPoSt(minerID, mbi.Sectors, proofs, randomness)
 					fmt.Printf("verify winningPoSt ok %v error %v\n", ok, err)
 				}
@@ -130,6 +159,48 @@ var runCmd = &cli.Command{
 
 		return nil
 	},
+}
+
+var verifyCmd = &cli.Command{
+	Name: "verify",
+	Flags: []cli.Flag{
+		&cli.StringFlag{
+			Name:  "in",
+			Value: "./winningProofs",
+		},
+	},
+	Action: func(cctx *cli.Context) error {
+
+		if cctx.String("in") != "" {
+			f, err := os.Open(cctx.String("in"))
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			b, err := ioutil.ReadAll(f)
+			if err != nil {
+				return err
+			}
+
+			var ret WinningOut
+			err = json.Unmarshal(b, &ret)
+			if err != nil {
+				return err
+			}
+
+			ok, err := verifyWinningPoSt(ret.MinerID, ret.Sectors, ret.Proofs, ret.Randomness)
+			fmt.Printf("verify winningPoSt ok %v error %v\n", ok, err)
+		}
+
+		return nil
+	},
+}
+
+type WinningOut struct {
+	MinerID    abi.ActorID
+	Sectors    []proof5.SectorInfo
+	Proofs     []proof5.PoStProof
+	Randomness abi.PoStRandomness
 }
 
 func pubSectorToPriv(mid abi.ActorID, sectorInfo []proof5.SectorInfo, path string) (ffi.SortedPrivateSectorInfo, error) {
