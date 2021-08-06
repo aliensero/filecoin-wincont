@@ -1,16 +1,22 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"os"
 
+	ffi "github.com/filecoin-project/filecoin-ffi"
 	"github.com/filecoin-project/go-address"
 	"github.com/filecoin-project/go-state-types/abi"
+	"github.com/filecoin-project/go-state-types/crypto"
 	"github.com/filecoin-project/lotus/chain/gen"
+	"github.com/filecoin-project/lotus/chain/store"
 	"github.com/filecoin-project/lotus/chain/types"
 	lcli "github.com/filecoin-project/lotus/cli"
+	proof5 "github.com/filecoin-project/specs-actors/v5/actors/runtime/proof"
 	"github.com/urfave/cli/v2"
+	"golang.org/x/xerrors"
 )
 
 func main() {
@@ -44,6 +50,9 @@ var runCmd = &cli.Command{
 		},
 		&cli.StringFlag{
 			Name: "actor",
+		},
+		&cli.StringFlag{
+			Name: "path",
 		},
 	},
 	Action: func(cctx *cli.Context) error {
@@ -85,10 +94,95 @@ var runCmd = &cli.Command{
 				continue
 			}
 			if winner != nil {
-				fmt.Printf("actor %v heigth %d wincount %d\n", addr, i, winner.WinCount)
+				fmt.Printf("actor %v heigth %d wincount %d sectors %v\n", addr, i, winner.WinCount, mbi.Sectors)
+				if cctx.IsSet("path") {
+					actorID, err := address.IDFromAddress(addr)
+					if err != nil {
+						return err
+					}
+					minerID := abi.ActorID(actorID)
+					privsectors, err := pubSectorToPriv(minerID, mbi.Sectors, cctx.String("path"))
+					if err != nil {
+						return err
+					}
+
+					buf := new(bytes.Buffer)
+					if err := addr.MarshalCBOR(buf); err != nil {
+						err = xerrors.Errorf("failed to marshal miner address: %w", err)
+						return err
+					}
+					rand, err := store.DrawRandomness(rbase.Data, crypto.DomainSeparationTag_WinningPoStChallengeSeed, round, buf.Bytes())
+					if err != nil {
+						err = xerrors.Errorf("failed to get randomness for winning post: %w", err)
+						return err
+					}
+					randomness := abi.PoStRandomness(rand)
+					randomness[31] &= 0x3f
+					proofs, err := ffi.GenerateWinningPoSt(minerID, privsectors, randomness)
+					if err != nil {
+						return err
+					}
+					ok, err := verifyWinningPoSt(minerID, mbi.Sectors, proofs, randomness)
+					fmt.Printf("verify winningPoSt ok %v error %v\n", ok, err)
+				}
 			}
 		}
 
 		return nil
 	},
+}
+
+func pubSectorToPriv(mid abi.ActorID, sectorInfo []proof5.SectorInfo, path string) (ffi.SortedPrivateSectorInfo, error) {
+
+	var out []ffi.PrivateSectorInfo
+	for _, s := range sectorInfo {
+
+		postProofType, err := abi.RegisteredSealProof.RegisteredWinningPoStProof(s.SealProof)
+		if err != nil {
+			return ffi.SortedPrivateSectorInfo{}, err
+		}
+
+		out = append(out, ffi.PrivateSectorInfo{
+			CacheDirPath:     fmt.Sprintf("%s/cache/s-t0%d-%d", path, mid, s.SectorNumber),
+			PoStProofType:    postProofType,
+			SealedSectorPath: fmt.Sprintf("%s/sealed/s-t0%d-%d", path, mid, s.SectorNumber),
+			SectorInfo:       s,
+		})
+	}
+
+	return ffi.NewSortedPrivateSectorInfo(out...), nil
+}
+
+func verifyWinningPoSt(minerID abi.ActorID, sectorInfo []proof5.SectorInfo, proofs []proof5.PoStProof, randomness abi.PoStRandomness) (bool, error) {
+
+	var provingSet []proof5.SectorInfo
+	for _, s := range sectorInfo {
+		p := proof5.SectorInfo{
+			SealProof:    s.SealProof,
+			SectorNumber: s.SectorNumber,
+			SealedCID:    s.SealedCID,
+		}
+		provingSet = append(provingSet, p)
+	}
+	winningPostProofType, err := abi.RegisteredSealProof.RegisteredWinningPoStProof(sectorInfo[0].SealProof)
+	if err != nil {
+		return false, err
+	}
+
+	// figure out which sectors have been challenged
+	indicesInProvingSet, err := ffi.GenerateWinningPoStSectorChallenge(winningPostProofType, minerID, randomness[:], uint64(len(provingSet)))
+	if err != nil {
+		return false, err
+	}
+
+	var challengedSectors []proof5.SectorInfo
+	for idx := range indicesInProvingSet {
+		challengedSectors = append(challengedSectors, provingSet[indicesInProvingSet[idx]])
+	}
+	return ffi.VerifyWinningPoSt(proof5.WinningPoStVerifyInfo{
+		Randomness:        randomness[:],
+		Proofs:            proofs,
+		ChallengedSectors: challengedSectors,
+		Prover:            minerID,
+	})
 }
